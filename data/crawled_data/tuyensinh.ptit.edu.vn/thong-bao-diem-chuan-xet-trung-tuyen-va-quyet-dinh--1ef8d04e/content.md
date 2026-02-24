@@ -1,0 +1,1 @@
+Học viện Thông báo điểm chuẩn xét trúng tuyển và Quyết định phê duyệt danh sách trúng tuyển Đại học theo hình thức VLVH đợt 2 năm 2023 (File đính kèm)

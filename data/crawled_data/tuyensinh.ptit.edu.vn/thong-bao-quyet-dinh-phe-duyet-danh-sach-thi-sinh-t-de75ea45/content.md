@@ -1,0 +1,1 @@
+Học viện Thông báo quyết định phê duyệt danh sách thí sinh trúng tuyển vào ĐH theo hình thức GDTX đợt 6 năm 2023. Phương thức xét tuyển: Xét tuyển thẳng và Xét tuyển dựa vào kết quả học tập 03 năm THPT. Chi tiết tại file đính kèm.
