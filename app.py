@@ -2,7 +2,7 @@
 app.py
 ------
 Giao diện chatbot tư vấn tuyển sinh PTIT sử dụng Streamlit.
-Tích hợp Agentic RAG (rag_graph.py) với hỗ trợ:
+Tích hợp Advanced RAG (rag_graph.py) với hỗ trợ:
   - Conversation memory (lịch sử hội thoại đa lượt)
   - Human-in-the-Loop (hỏi lại khi câu hỏi mơ hồ)
   - Hiển thị nguồn tham khảo
@@ -217,11 +217,11 @@ with st.sidebar:
         """
         **Chatbot Tư Vấn Tuyển Sinh PTIT**
 
-        Sử dụng kiến trúc **Agentic RAG** (LangGraph):
-        -  Phân tách câu hỏi phức tạp thành sub-queries
-        -  Tìm kiếm song song (Send API)
-        -  Lọc tài liệu bằng LLM grader
-        -  Tự sửa nếu không tìm thấy kết quả (tối đa 3 lần)
+        Sử dụng kiến trúc **Advanced RAG** (LangGraph):
+        -  Phân loại intent & phân tách câu hỏi phức tạp
+        -  Human-in-the-Loop: yêu cầu làm rõ khi câu hỏi thiếu thông tin
+        -  Tìm kiếm song song (Send API) trên vector store
+        -  ParentDocumentRetriever: trích xuất chunks lớn đủ ngữ cảnh
         -  Ghi nhớ lịch sử hội thoại (MemorySaver)
 
         ---

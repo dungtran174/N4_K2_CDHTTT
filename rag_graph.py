@@ -1,26 +1,20 @@
 """
 rag_graph.py
 ------------
-Agentic RAG nâng cao cho chatbot tuyển sinh PTIT, xây dựng bằng LangGraph.
+Advanced RAG cho chatbot tuyển sinh PTIT, xây dựng bằng LangGraph.
 
 Kiến trúc tổng thể:
   START → analyze_query
          ├─(cần làm rõ)─→ human_clarify ──→ analyze_query (lặp lại)
-         └─(rõ ràng)────→ retrieve_single (song song qua Send API)
+         ├─(general)────→ general_chat → END
+         └─(admission)──→ retrieve_single (song song qua Send API)
                                  ↓ (gộp kết quả)
-                          grade_and_filter
-                         ├─(có tài liệu)──→ generate_answer → END
-                         ├─(không có, retry < 3)─→ self_correct
-                         └─(không có, retry ≥ 3)─→ generate_answer → END
-                                 ↓
-                          retrieve_single (song song, queries mới)
+                          generate_answer → END
 
 Tính năng:
   - Multi-query decomposition (chia câu hỏi phức tạp thành sub_queries)
   - Parallel retrieval dùng LangGraph Send API
   - ParentDocumentRetriever (child chunks → search, parent chunks → context)
-  - LLM-based relevance grading
-  - Self-correction với query rewriting (tối đa 3 lần)
   - Human-in-the-Loop (interrupt_before=["human_clarify"])
   - MemorySaver (lưu state theo thread_id, hỗ trợ multi-turn)
 """
@@ -28,14 +22,13 @@ Tính năng:
 import os
 import logging
 import pickle
-import operator
 from typing import Annotated, TypedDict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from langchain_community.vectorstores import Chroma
@@ -53,11 +46,10 @@ load_dotenv()
 
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-EMBEDDING_MODEL  = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL  = "dangvantuan/vietnamese-embedding"
 PARENT_VECTOR_DIR = "./parent_vector_store"   # ChromaDB lưu child chunks
 PARENT_DOCSTORE_DIR = "./parent_docstore"     # LocalFileStore lưu parent chunks
 TOP_K     = 15   # Số docs trả về mỗi truy vấn (tăng để bắt nhiều section hơn)
-MAX_RETRY = 3    # Số lần self-correct tối đa
 
 
 # ── Custom State Reducer ──────────────────────────────────────────────────────────────────
@@ -90,7 +82,6 @@ class GraphState(TypedDict):
     clarification_needed: bool            # Graph có cần hỏi lại người dùng không?
     intent:              str              # 'admission' hoặc 'general'
     generation:          str              # Câu trả lời cuối cùng
-    retry_count:         int              # Số lần đã self-correct
 
 
 # ── Khởi tạo LLM & Retriever (singleton, lazy) ────────────────────────────────
@@ -99,17 +90,17 @@ _llm       = None
 _retriever = None
 
 
-def get_llm() -> ChatGroq:
-    """Khởi tạo ChatGroq Llama-3.3-70b (lazy singleton)."""
+def get_llm() -> ChatGoogleGenerativeAI:
+    """Khởi tạo ChatGoogleGenerativeAI (Gemini) (lazy singleton)."""
     global _llm
     if _llm is None:
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise ValueError("Thiếu GROQ_API_KEY trong file .env")
-        _llm = ChatGroq(
-            model="llama-3.3-70b-versatile",
+            raise ValueError("Thiếu GOOGLE_API_KEY trong file .env")
+        _llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
             temperature=0,
-            groq_api_key=api_key,
+            google_api_key=api_key,
         )
     return _llm
 
@@ -220,38 +211,60 @@ def analyze_query(state: GraphState) -> dict:
     history   = _format_history(state.get("chat_history", []))
 
     prompt = ChatPromptTemplate.from_template(
-        """Bạn là AI phân tích câu hỏi của người dùng trên chatbot PTIT.
+        """Bạn là bộ định tuyến AI (Router Agent) của hệ thống chatbot PTIT.
+Nhiệm vụ của bạn là phân tích câu hỏi và trả về ĐÚNG định dạng JSON. KHÔNG ĐƯỢC sinh thêm bất kỳ chữ nào khác ngoài JSON.
 
-Lịch sử hội thoại gần nhất:
+Lịch sử hội thoại:
 {history}
 
-Câu hỏi hiện tại của người dùng: "{question}"
+Câu hỏi hiện tại: "{question}"
 
-Nhiệm vụ:
+QUY TẮC BẮT BUỘC:
+1. Intent: "admission" (hỏi về điểm, học phí, ngành, xét tuyển...) hoặc "general" (chào hỏi).
+2. Clarification_needed: NẾU người dùng hỏi về "điểm chuẩn", "học phí", "chỉ tiêu" MÀ KHÔNG HỀ CÓ tên ngành cụ thể (trong câu hỏi hoặc trong lịch sử), BẮT BUỘC gán là true.
+3. sub_queries: Nếu clarification_needed=true, để rỗng []. Nếu false, viết lại câu hỏi rõ ràng.
 
-**Bước 1 — Phân loại intent:**
-- Nếu câu hỏi liên quan đến tuyển sinh, học viện, điểm chuẩn, học phí, ngành học,
-  ký túc xá, chương trình đào tạo, học bổng PTIT hoặc bất kỳ thông tin học thuật
-  nào về PTIT → intent: "admission"
-- Nếu câu hỏi là giao tiếp xã giao ("Chào bạn", "Bạn là ai", "Cảm ơn"),
-  hỏi kiến thức chung ("1+1 bằng mấy", "Thủ đô Pháp là gì") hoặc hoàn toàn
-  không liên quan đến tuyển sinh PTIT → intent: "general"
+--- CÁC VÍ DỤ MẪU ---
+Ví dụ 1:
+Lịch sử: Không có.
+Câu hỏi: "Cho em hỏi điểm chuẩn năm ngoái ạ"
+→ Thiếu tên ngành → clarification_needed = true
+JSON: {{"intent": "admission", "clarification_needed": true, "sub_queries": []}}
 
-**Bước 2 — Xử lý câu hỏi tuyển sinh (chỉ khi intent == "admission"):**
-1. Nếu câu hỏi KHÔNG THỂ hiểu được dù có lịch sử (quá mơ hồ, thiếu chủ thể)
-   → clarification_needed: true, sub_queries: []
+Ví dụ 2:
+Lịch sử: Không có.
+Câu hỏi: "Ngành Công nghệ thông tin học phí bao nhiêu?"
+→ Có tên ngành cụ thể → clarification_needed = false
+JSON: {{"intent": "admission", "clarification_needed": false, "sub_queries": ["Học phí ngành Công nghệ thông tin Học viện PTIT là bao nhiêu?"]}}
 
-2. Nếu câu hỏi phức tạp, cần tìm nhiều thông tin riêng biệt
-   (VD: "so sánh học phí IT và Marketing", "điều kiện và thời hạn học bổng")
-   → chia thành tối đa 3 sub_queries độc lập, đầy đủ (không cần đọc lịch sử để hiểu)
+Ví dụ 3:
+Lịch sử: 
+Người dùng: Điểm chuẩn ngành An toàn thông tin?
+Trợ lý: 26 điểm.
+Câu hỏi: "Thế học phí của ngành này đắt không?"
+→ Có tên ngành từ lịch sử (An toàn thông tin) → clarification_needed = false
+JSON: {{"intent": "admission", "clarification_needed": false, "sub_queries": ["Học phí ngành An toàn thông tin PTIT là bao nhiêu?"]}}
 
-3. Nếu câu hỏi đơn giản hoặc lịch sử đủ để hiểu
-   → sub_queries gồm đúng 1 câu hỏi hoàn chỉnh (kết hợp ngữ cảnh lịch sử nếu cần)
+Ví dụ 4:
+Lịch sử: Không có.
+Câu hỏi: "Chào bạn, bạn là ai?"
+→ Intent = general → clarification_needed = false, sub_queries = []
+JSON: {{"intent": "general", "clarification_needed": false, "sub_queries": []}}
 
-Nếu intent == "general" → clarification_needed: false, sub_queries: []
+Ví dụ 5:
+Lịch sử: Không có.
+Câu hỏi: "Chỉ tiêu tuyển sinh bao nhiêu?"
+→ Thiếu tên ngành → BẮT BUỘC clarification_needed = true
+JSON: {{"intent": "admission", "clarification_needed": true, "sub_queries": []}}
 
-Trả về JSON hợp lệ (KHÔNG markdown, KHÔNG text thêm):
-{{"intent": "admission"|"general", "clarification_needed": true|false, "sub_queries": ["..."]}}"""  
+Ví dụ 6:
+Lịch sử: Không có.
+Câu hỏi: "So sánh học phí IT với Marketing"
+→ Có 2 tên ngành cụ thể → chia 2 sub_queries
+JSON: {{"intent": "admission", "clarification_needed": false, "sub_queries": ["Học phí ngành Công nghệ thông tin PTIT", "Học phí ngành Marketing PTIT"]}}
+-----------------------
+
+KẾT QUẢ JSON CỦA BẠN:"""
     )
 
     chain = prompt | llm | JsonOutputParser()
@@ -272,12 +285,12 @@ Trả về JSON hợp lệ (KHÔNG markdown, KHÔNG text thêm):
     return {
         "intent":               intent,
         "sub_queries":          sub_queries,
-        "documents":            None,   # Reset: xóa tài liệu từ lần query trước
-        "retry_count":          0,
+        "documents":            None,   
+        "clarification_needed": clarification_needed,# Reset: xóa tài liệu từ lần query trước
     }
 
 
-# ── Node 2: general_chat ─────────────────────────────────────────────────────
+# ── Node 2: general_chat ──────────────────────────────────────────────────────
 
 def general_chat(state: GraphState) -> dict:
     """
@@ -337,11 +350,10 @@ def human_clarify(state: GraphState) -> dict:
     """
     return {
         "clarification_needed": False,  # Đã nhận được làm rõ, tắt flag
-        "retry_count":          0,      # Reset retry counter
     }
 
 
-# ── Node 3: retrieve_single ───────────────────────────────────────────────────
+# ── Node 4: retrieve_single ───────────────────────────────────────────────────
 
 def retrieve_single(state: dict) -> dict:
     """
@@ -368,138 +380,21 @@ def retrieve_single(state: dict) -> dict:
     return {"documents": docs}
 
 
-# ── Node 4: grade_and_filter ──────────────────────────────────────────────────
-
-def grade_and_filter(state: GraphState) -> dict:
-    """
-    Chấm điểm độ liên quan của từng tài liệu bằng LLM.
-    Giữ lại tài liệu liên quan, loại bỏ tài liệu lạc đề.
-
-    - Tiêu chí RỘNG: giữ lại nếu tài liệu có liên quan dù gián tiếp.
-    - Fallback: nếu grader lọc hết, dùng raw docs để không mất kết quả.
-    """
-    llm      = get_llm()
-    question = state["original_question"]
-    raw_docs = state.get("documents", [])
-
-    if not raw_docs:
-        return {"documents": None}  # Reset → [] (không có gì để grade)
-
-    grade_prompt = ChatPromptTemplate.from_template(
-        """Bạn là chuyên gia đánh giá độ liên quan của tài liệu tuyển sinh PTIT.
-
-Câu hỏi cần trả lời: "{question}"
-
-Đoạn tài liệu:
-{document}
-
-Hãy đánh giá theo tiêu chí RỘNG: tài liệu liên quan nếu nó chứa BẤT KỲ thông tin nào
-có thể giúp trả lời câu hỏi, kể cả gián tiếp (ví dụ: đề cập đến cùng chủ đề, cùng năm,
-cùng ngành, điều kiện liên quan, quy trình liên quan...).
-Chỉ đánh dấu KHÔNG liên quan nếu tài liệu hoàn toàn nói về chủ đề khác.
-Trả về JSON (KHÔNG markdown): {{"relevant": true}} hoặc {{"relevant": false}}"""
-    )
-
-    grader = grade_prompt | llm | JsonOutputParser()
-
-    # Lọc trùng lặp theo content trước khi grade
-    seen_content: set = set()
-    unique_docs = []
-    for doc in raw_docs:
-        key = doc.page_content[:200]
-        if key not in seen_content:
-            seen_content.add(key)
-            unique_docs.append(doc)
-
-    # Grade từng tài liệu
-    filtered = []
-    for doc in unique_docs:
-        try:
-            result = grader.invoke({
-                "question": question,
-                "document": doc.page_content[:800],  # Giới hạn token
-            })
-            if result.get("relevant", False):
-                filtered.append(doc)
-        except Exception:
-            filtered.append(doc)  # Giữ lại nếu grader lỗi (conservative)
-
-    # Fallback: nếu grader lọc hết toàn bộ → dùng tài liệu thô
-    # để tránh mất trắng kết quả retrieval do grader quá nghiêm
-    if not filtered and unique_docs:
-        logger.warning(
-            f"Grader đã lọc hết {len(unique_docs)} docs. "
-            "Fallback: dùng raw unique_docs để tránh mất kết quả."
-        )
-        filtered = unique_docs
-
-    return {"documents": filtered}
-
-
-# ── Node 5: self_correct ─────────────────────────────────────────────────────
-
-def self_correct(state: GraphState) -> dict:
-    """
-    Khi không tìm được tài liệu liên quan sau khi grade:
-      1. Sinh ra các sub_queries mới (khác cách diễn đạt)
-      2. Tăng retry_count
-      3. Reset documents để retrieval lại từ đầu
-
-    Tối đa MAX_RETRY lần (kiểm soát bởi route_after_grade).
-    """
-    llm         = get_llm()
-    question    = state["original_question"]
-    old_queries = state.get("sub_queries", [])
-    retry_count = state.get("retry_count", 0)
-
-    prompt = ChatPromptTemplate.from_template(
-        """Các truy vấn dưới đây đã được thử nhưng KHÔNG tìm thấy tài liệu liên quan:
-{old_queries}
-
-Câu hỏi gốc của người dùng: "{question}"
-Đây là lần thử số {retry}.
-
-Hãy đề xuất {n} cách diễn đạt KHÁC (từ khóa khác, góc nhìn khác, tổng quát hơn hoặc cụ thể hơn)
-để tìm thông tin tuyển sinh PTIT liên quan đến câu hỏi trên.
-
-Trả về JSON (KHÔNG markdown): {{"sub_queries": ["cách 1", "cách 2", ...]}}"""
-    )
-
-    chain = prompt | llm | JsonOutputParser()
-
-    try:
-        result = chain.invoke({
-            "question":   question,
-            "old_queries": "\n".join(f"  - {q}" for q in old_queries),
-            "retry":       retry_count + 1,
-            "n":           min(3, MAX_RETRY - retry_count),
-        })
-        new_queries = result.get("sub_queries") or [question]
-    except Exception:
-        new_queries = [question]
-
-    return {
-        "sub_queries": new_queries,
-        "documents":   None,           # Reset: xóa docs cũ trước khi retrieve lại
-        "retry_count": retry_count + 1,
-    }
-
-
-# ── Node 6: generate_answer ───────────────────────────────────────────────────
+# ── Node 5: generate_answer ───────────────────────────────────────────────────
 
 def generate_answer(state: GraphState) -> dict:
     """
-    Tổng hợp tài liệu đã lọc để tạo câu trả lời cuối cùng.
+    Tổng hợp tài liệu đã thu thập để tạo câu trả lời cuối cùng.
 
-    - Nếu có tài liệu: trả lời dựa trên tài liệu, trích dẫn [Nguồn X]
-    - Nếu không có tài liệu (sau khi đã retry hết): thông báo không tìm thấy
+    - Nếu có tài liệu: trả lời dựa trên tài liệu
+    - Nếu không có tài liệu: thông báo không tìm thấy
     """
     llm          = get_llm()
     question     = state["original_question"]
     documents    = state.get("documents", [])
     chat_history = state.get("chat_history", [])
 
-    # Xây dựng context từ các tài liệu đã lọc
+    # Xây dựng context từ các tài liệu đã thu thập
     if documents:
         context_parts = []
         for i, doc in enumerate(documents, 1):
@@ -510,7 +405,7 @@ def generate_answer(state: GraphState) -> dict:
             
         context = "\n\n---\n\n".join(context_parts)
     else:
-        context = "Không tìm thấy tài liệu liên quan trong hệ thống sau nhiều lần thử."
+        context = "Không tìm thấy tài liệu liên quan trong hệ thống."
 
     history_text = _format_history(chat_history)
 
@@ -527,7 +422,7 @@ Tài liệu tham khảo:
 Câu hỏi: {question}
 
 Nguyên tắc trả lời:
-1. Ưu tiên dùng thông tin từ [Nguồn X] — trích dẫn rõ ràng khi dùng.
+1. Ưu tiên dùng thông tin từ [Nguồn X] — không cần trích dẫn.
 2. Nếu không có tài liệu → thông báo lịch sự, gợi ý liên hệ trực tiếp PTIT.
 3. KHÔNG bịa đặt điểm chuẩn, học phí, tên ngành nếu không có trong tài liệu.
 4. Với câu hỏi chào hỏi/xã giao → trả lời tự nhiên, không cần trích dẫn.
@@ -571,34 +466,6 @@ def route_after_analyze(state: GraphState):
     ]
 
 
-def route_after_grade(state: GraphState):
-    """
-    Sau grade_and_filter:
-      - Có tài liệu liên quan → generate_answer
-      - Không có, retry_count < MAX_RETRY → self_correct (thử lại với query mới)
-      - Không có, đã retry hết → generate_answer (thông báo không tìm thấy)
-    """
-    docs        = state.get("documents", [])
-    retry_count = state.get("retry_count", 0)
-
-    if docs:
-        return "generate_answer"
-    elif retry_count < MAX_RETRY:
-        return "self_correct"
-    else:
-        return "generate_answer"  # Hết retry → trả lời với thông tin không đủ
-
-
-def route_after_self_correct(state: GraphState):
-    """
-    Sau self_correct: fan-out lại với sub_queries mới.
-    """
-    return [
-        Send("retrieve_single", {"query": q})
-        for q in state.get("sub_queries", [state["original_question"]])
-    ]
-
-
 # ════════════════════════════════════════════════════════════════════════════════
 # XÂY DỰNG GRAPH
 # ════════════════════════════════════════════════════════════════════════════════
@@ -616,31 +483,19 @@ def build_graph():
     graph.add_node("general_chat",     general_chat)
     graph.add_node("human_clarify",    human_clarify)
     graph.add_node("retrieve_single",  retrieve_single)
-    graph.add_node("grade_and_filter", grade_and_filter)
-    graph.add_node("self_correct",     self_correct)
     graph.add_node("generate_answer",  generate_answer)
 
     # ── Edges cố định ─────────────────────────────────────────────────────────
     graph.add_edge(START,             "analyze_query")
     graph.add_edge("general_chat",    END)               # general_chat → kết thúc ngay
     graph.add_edge("human_clarify",   "analyze_query")   # Sau khi làm rõ → phân tích lại
-    graph.add_edge("retrieve_single", "grade_and_filter")  # Fan-in: mọi retrieve_single đổ về grade
+    graph.add_edge("retrieve_single", "generate_answer")  # Fan-in: mọi retrieve_single đổ về generate
 
     # ── Conditional edges ─────────────────────────────────────────────────────
     graph.add_conditional_edges(
         "analyze_query",
         route_after_analyze,
         ["human_clarify", "general_chat", "retrieve_single"],
-    )
-    graph.add_conditional_edges(
-        "grade_and_filter",
-        route_after_grade,
-        ["generate_answer", "self_correct"],
-    )
-    graph.add_conditional_edges(
-        "self_correct",
-        route_after_self_correct,
-        ["retrieve_single"],
     )
 
     graph.add_edge("generate_answer", END)
@@ -723,7 +578,6 @@ def run_graph(
         "clarification_needed": False,
         "intent":              "admission",
         "generation":          "",
-        "retry_count":         0,
     }
 
     result = graph.invoke(initial_state, config=config)
@@ -786,7 +640,7 @@ def resume_after_clarification(
 if __name__ == "__main__":
     import uuid
 
-    print("=== Test Agentic RAG Graph ===\n")
+    print("=== Test Advanced RAG Graph ===\n")
     tid = str(uuid.uuid4())
 
     result = run_graph(

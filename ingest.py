@@ -48,7 +48,7 @@ PARENT_DOCSTORE_DIR  = "./parent_docstore"     # Parent chunks LocalFileStore (r
 CHUNK_SIZE    = 1000
 CHUNK_OVERLAP = 150
 # Model nhỏ (~500MB), hỗ trợ đa ngôn ngữ bao gồm tiếng Việt
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDING_MODEL = "dangvantuan/vietnamese-embedding"
 
 # Dùng HuggingFace mirror để tải model nhanh hơn ở Việt Nam
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
