@@ -1,2 +1,13 @@
-.env
-.venv
+
+.env 
+
+venv/ 
+.venv/
+env/
+
+__pycache__/ 
+*.py[cod]
+
+
+parent_vector_store/ 
+parent_docstore/
